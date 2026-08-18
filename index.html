@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Avian Radar Real-Topo</title>
+    <style>
+        :root {
+            --neon-blue: #00f3ff;
+            --neon-pink: #ff007c;
+            --bg-dark: #020205;
+        }
+
+        body {
+            margin: 0; overflow: hidden; background-color: var(--bg-dark);
+            font-family: 'Courier New', Courier, monospace; color: var(--neon-blue);
+        }
+
+        #map-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+
+        #ui-panel {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            background: rgba(2, 2, 5, 0.85); border: 1px solid var(--neon-blue);
+            padding: 15px; border-radius: 8px; width: 280px;
+            box-shadow: 0 0 15px rgba(0, 243, 255, 0.2); backdrop-filter: blur(5px);
+        }
+
+        h3 { margin: 0 0 5px 0; font-size: 16px; text-transform: uppercase; }
+        .status-text { font-size: 10px; color: #aaa; margin-bottom: 10px; display: block; }
+
+        .btn {
+            background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-blue); color: var(--neon-blue);
+            padding: 10px; width: 100%; cursor: pointer; font-weight: bold; transition: all 0.3s;
+        }
+        .btn:hover, .btn.active { background: var(--neon-blue); color: #000; box-shadow: 0 0 10px var(--neon-blue); }
+
+        #feed { margin-top: 15px; max-height: 40vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+        .card { border-left: 3px solid var(--neon-pink); background: rgba(255, 0, 124, 0.1); padding: 8px; font-size: 11px; }
+
+        #visualizer-pip {
+            position: absolute; bottom: 20px; right: 20px; width: 180px; height: 180px;
+            z-index: 10; border-radius: 50%; border: 2px solid rgba(0, 243, 255, 0.3);
+            background: radial-gradient(circle, rgba(0,243,255,0.05) 0%, rgba(0,0,0,0.8) 70%);
+            box-shadow: 0 0 20px rgba(0, 243, 255, 0.2); overflow: hidden;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+
+    <div id="map-container"></div>
+
+    <div id="ui-panel">
+        <h3>Radar de Campo</h3>
+        <span class="status-text" id="gps-data">Esperando conexión GPS y Topográfica...</span>
+        <button id="startBtn" class="btn">INICIAR SESIÓN</button>
+        <div id="feed"></div>
+    </div>
+
+    <div id="visualizer-pip"></div>
+
+    <script>
+        // === VARIABLES GLOBALES ===
+        let audioCtx, analyser, dataArray;
+        let isListening = false;
+        let baseLat = null, baseLon = null;
+        let pyramids = []; // Almacén de las detecciones
+        let waterLevel = 0; // Se calculará dinámicamente según la elevación
+
+        // === 1. MAPA 3D Y RADAR ===
+        const sceneMap = new THREE.Scene();
+        sceneMap.fog = new THREE.FogExp2(0x020205, 0.012);
+
+        const cameraMap = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+        cameraMap.position.set(0, 45, 55);
+
+        const rendererMap = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        rendererMap.setSize(window.innerWidth, window.innerHeight);
+        document.getElementById('map-container').appendChild(rendererMap.domElement);
+
+        const controlsMap = new THREE.OrbitControls(cameraMap, rendererMap.domElement);
+        controlsMap.enableDamping = true;
+        controlsMap.maxPolarAngle = Math.PI / 2 - 0.1;
+
+        // Terreno base
+        const mapSize = 150;
+        const segments = 50; 
+        let planeGeo = new THREE.PlaneGeometry(mapSize, mapSize, segments, segments);
+        planeGeo.rotateX(-Math.PI / 2);
+        
+        // Habilitar colores en los vértices del terreno
+        planeGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(planeGeo.attributes.position.count * 3), 3));
+        
+        const planeMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.6 });
+        let mapMesh = new THREE.LineSegments(new THREE.WireframeGeometry(planeGeo), planeMat);
+        sceneMap.add(mapMesh);
+
+        // Línea del Radar
+        const radarLaser = new THREE.Mesh(
+            new THREE.BoxGeometry(mapSize, 0.5, 0.5),
+            new THREE.MeshBasicMaterial({ color: 0x00f3ff, transparent: true, opacity: 0.8 })
+        );
+        sceneMap.add(radarLaser);
+        let radarZ = -mapSize/2;
+
+        const worldGroup = new THREE.Group();
+        sceneMap.add(worldGroup);
+
+        // Pin de usuario
+        const userPin = new THREE.Mesh(
+            new THREE.OctahedronGeometry(1.5, 0),
+            new THREE.MeshBasicMaterial({ color: 0x00f3ff, wireframe: true })
+        );
+        userPin.position.y = 5;
+        sceneMap.add(userPin);
+
+        // === 2. PIP VISUALIZADOR ===
+        const scenePip = new THREE.Scene();
+        const cameraPip = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+        cameraPip.position.z = 18;
+        const rendererPip = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        rendererPip.setSize(180, 180);
+        document.getElementById('visualizer-pip').appendChild(rendererPip.domElement);
+
+        const blobGeo = new THREE.SphereGeometry(4, 32, 32);
+        const originalBlobPos = new Float32Array(blobGeo.attributes.position.array);
+        blobGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(blobGeo.attributes.position.count * 3), 3));
+        const blobMat = new THREE.MeshBasicMaterial({ vertexColors: true, wireframe: true });
+        const blobMesh = new THREE.Mesh(blobGeo, blobMat);
+        scenePip.add(blobMesh);
+
+        // === 3. API DE TOPOGRAFÍA Y GPS ===
+        function initGPS() {
+            if ("geolocation" in navigator) {
+                navigator.geolocation.getCurrentPosition((pos) => {
+                    baseLat = pos.coords.latitude;
+                    baseLon = pos.coords.longitude;
+                    document.getElementById('gps-data').innerText = `GPS OK. Descargando topografía real...`;
+                    fetchRealTopography(baseLat, baseLon);
+                }, (err) => {
+                    document.getElementById('gps-data').innerText = "Error GPS. Usando terreno simulado.";
+                    generateMockTopography();
+                });
+            }
+        }
+
+        async function fetchRealTopography(lat, lon) {
+            // Generamos una cuadrícula de 10x10 coordenadas alrededor de tu ubicación (100 puntos máx por petición gratuita)
+            let locations = [];
+            const offset = 0.005; // aprox 500 metros
+            for(let i=0; i<10; i++) {
+                for(let j=0; j<10; j++) {
+                    let plat = lat - (offset/2) + (i * (offset/10));
+                    let plon = lon - (offset/2) + (j * (offset/10));
+                    locations.push(`${plat},${plon}`);
+                }
+            }
+            
+            try {
+                // OpenTopoData API (Gratuita, Dataset SRTM30m global)
+                const response = await fetch(`https://api.opentopodata.org/v1/srtm30m?locations=${locations.join('|')}`);
+                const data = await response.json();
+                
+                if(data.results) {
+                    const elevations = data.results.map(r => r.elevation || 0);
+                    applyElevationToMap(elevations);
+                    document.getElementById('gps-data').innerText = `Topografía real cargada (${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+                }
+            } catch(e) {
+                document.getElementById('gps-data').innerText = "Error API Topo. Usando terreno simulado.";
+                generateMockTopography();
+            }
+        }
+
+        function applyElevationToMap(elevations) {
+            // Encontrar min y max para normalizar la altura visualmente
+            const minElev = Math.min(...elevations);
+            const maxElev = Math.max(...elevations);
+            waterLevel = minElev + ((maxElev - minElev) * 0.15); // El 15% más bajo se considerará agua
+
+            const posAttr = planeGeo.attributes.position;
+            const colAttr = planeGeo.attributes.color;
+            
+            for (let i = 0; i < posAttr.count; i++) {
+                // Mapear los vértices (2500) a los 100 puntos reales interpolando
+                const gridX = Math.floor((posAttr.getX(i) + mapSize/2) / (mapSize/10));
+                const gridZ = Math.floor((posAttr.getZ(i) + mapSize/2) / (mapSize/10));
+                
+                // Limitar índices
+                const safeX = Math.max(0, Math.min(9, gridX));
+                const safeZ = Math.max(0, Math.min(9, gridZ));
+                
+                const elevIndex = safeX * 10 + safeZ;
+                let realElev = elevations[elevIndex] || minElev;
+                
+                // Escalar altura para que se vea bien en 3D
+                let y = ((realElev - minElev) / (maxElev - minElev)) * 15;
+                posAttr.setY(i, y);
+
+                // COLOREADO: Agua (Azul Oscuro) vs Tierra (Verde/Cian Radar)
+                if (realElev <= waterLevel) {
+                    // Cuerpo de agua: #001133 a #003366
+                    colAttr.setXYZ(i, 0.0, 0.1, 0.3);
+                } else {
+                    // Tierra: #004455 base radar
+                    colAttr.setXYZ(i, 0.0, 0.26, 0.33);
+                }
+            }
+            posAttr.needsUpdate = true;
+            colAttr.needsUpdate = true;
+            
+            // Actualizar wireframe
+            sceneMap.remove(mapMesh);
+            mapMesh.geometry.dispose();
+            mapMesh.geometry = new THREE.WireframeGeometry(planeGeo);
+            sceneMap.add(mapMesh);
+        }
+
+        function generateMockTopography() {
+            // Backup por si falla la API
+            const elevations = [];
+            for(let i=0; i<100; i++) elevations.push(Math.random() * 50);
+            applyElevationToMap(elevations);
+        }
+
+        // === 4. SISTEMA DE MICRÓFONO Y DETECCIÓN ===
+        async function startMic() {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 512;
+
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const source = audioCtx.createMediaStreamSource(stream);
+            source.connect(analyser);
+
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            isListening = true;
+
+            document.getElementById('startBtn').innerText = "SISTEMA ACTIVO";
+            document.getElementById('startBtn').classList.add('active');
+            
+            initGPS();
+            setInterval(simulateDetection, 5000);
+        }
+
+        // === 5. BUCLE DE ANIMACIÓN (RADAR Y PIRÁMIDES) ===
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            // 5a. BARRIDO DE RADAR
+            radarZ += 1.5;
+            if (radarZ > mapSize/2) radarZ = -mapSize/2;
+            radarLaser.position.z = radarZ;
+
+            // 5b. LÓGICA DE PIRÁMIDES (DESVANECIMIENTO Y PULSO DE RADAR)
+            for (let i = pyramids.length - 1; i >= 0; i--) {
+                let p = pyramids[i];
+                let age = time - p.userData.spawnTime;
+
+                // Si la línea del radar pasa sobre la pirámide, hace un "Pulso" brilloso
+                if (Math.abs(p.position.z - radarZ) < 2.0) {
+                    p.scale.set(1.8, 1.8, 1.8);
+                    p.material.color.setHex(0xffffff); // Destello blanco
+                } else {
+                    // Regresa suavemente a su color rosa y tamaño normal
+                    p.scale.lerp(new THREE.Vector3(1, 1, 1), 0.1);
+                    p.material.color.lerp(new THREE.Color(0xff007c), 0.1);
+                }
+
+                // Desvanecimiento después de 15 segundos
+                if (age > 15) {
+                    p.material.opacity = Math.max(0, 1 - (age - 15) / 5); // Tarda 5 seg en hacerse invisible
+                    if (age > 20) {
+                        worldGroup.remove(p);
+                        p.geometry.dispose();
+                        p.material.dispose();
+                        pyramids.splice(i, 1); // Quitar del array
+                    }
+                }
+            }
+
+            // 5c. VISUALIZADOR DE AUDIO (PIP)
+            if (isListening) {
+                analyser.getByteFrequencyData(dataArray);
+                const pipPos = blobMesh.geometry.attributes.position;
+                const pipCol = blobMesh.geometry.attributes.color;
+
+                for (let i = 0; i < pipPos.count; i++) {
+                    const ox = originalBlobPos[i*3], oy = originalBlobPos[i*3+1], oz = originalBlobPos[i*3+2];
+                    const vertex = new THREE.Vector3(ox, oy, oz).normalize();
+                    
+                    const audioVal = dataArray[i % dataArray.length] / 255.0; 
+                    const displacement = 4 + (audioVal * 6);
+                    
+                    vertex.multiplyScalar(displacement);
+                    pipPos.setXYZ(i, vertex.x, vertex.y, vertex.z);
+
+                    const factor = Math.min((displacement - 4) / 4, 1.0);
+                    pipCol.setXYZ(i, 0.0 + factor, 0.95 - (0.95 * factor), 1.0 - (0.52 * factor));
+                }
+                pipPos.needsUpdate = true;
+                pipCol.needsUpdate = true;
+                blobMesh.rotation.y += 0.01;
+            }
+
+            userPin.rotation.y -= 0.02;
+            controlsMap.update();
+            rendererMap.render(sceneMap, cameraMap);
+            rendererPip.render(scenePip, cameraPip);
+        }
+
+        // === 6. CREACIÓN DE PIRÁMIDES ===
+        function simulateDetection() {
+            if(!isListening) return;
+            let avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+            
+            if (avg > 25) { // Umbral de volumen
+                const aves = ["Zenaida macroura", "Cardinalis cardinalis", "Haemorhous mexicanus"];
+                const ave = aves[Math.floor(Math.random() * aves.length)];
+                
+                const feed = document.getElementById('feed');
+                feed.innerHTML = `<div class="card"><strong>Eco de Ave</strong><br><i>${ave}</i></div>` + feed.innerHTML;
+                if(feed.children.length > 3) feed.removeChild(feed.lastChild);
+
+                // Crear Pirámide Anclada
+                const ecoMat = new THREE.MeshBasicMaterial({ color: 0xff007c, wireframe: true, transparent: true, opacity: 1 });
+                const ecoPin = new THREE.Mesh(new THREE.ConeGeometry(1.5, 3, 4), ecoMat);
+                
+                // Aparece cerca de tu ubicación aleatoriamente
+                ecoPin.position.set((Math.random() - 0.5) * 40, 5, (Math.random() - 0.5) * 40);
+                
+                // Guardamos la hora de creación para el desvanecimiento
+                ecoPin.userData = { spawnTime: clock.getElapsedTime() }; 
+                
+                worldGroup.add(ecoPin);
+                pyramids.push(ecoPin);
+            }
+        }
+
+        document.getElementById('startBtn').addEventListener('click', () => {
+            if (!isListening) startMic();
+        });
+
+        animate();
+    </script>
+</body>
+</html>
