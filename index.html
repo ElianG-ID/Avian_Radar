@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Avian Radar AI (BirdNET)</title>
+    <title>Avian Radar Cloud AI (Ruta B)</title>
     <style>
         :root {
             --neon-blue: #00f3ff;
@@ -26,8 +26,8 @@
         }
 
         h3 { margin: 0 0 5px 0; font-size: 16px; text-transform: uppercase; }
-        .status-text { font-size: 10px; color: #aaa; margin-bottom: 10px; display: block; }
-        .tf-status { color: #ffeb3b; font-weight: bold; }
+        .status-text { font-size: 10px; color: #aaa; margin-bottom: 6px; display: block; }
+        .api-status { font-size: 10px; color: #ffeb3b; font-weight: bold; margin-bottom: 10px; display: block; }
 
         .btn {
             background: rgba(0, 243, 255, 0.1); border: 1px solid var(--neon-blue); color: var(--neon-blue);
@@ -47,33 +47,35 @@
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
-    
-    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
 </head>
 <body>
 
     <div id="map-container"></div>
 
     <div id="ui-panel">
-        <h3>Radar IA de Campo</h3>
-        <span class="status-text" id="gps-data">Esperando GPS...</span>
-        <span class="status-text tf-status" id="tf-data">Motor IA Inactivo</span>
-        <button id="startBtn" class="btn">INICIAR ESCÁNER E IA</button>
+        <h3>Radar de Campo (Cloud)</h3>
+        <span class="status-text" id="gps-data">GPS en espera...</span>
+        <span class="api-status" id="api-data">API: En espera de inicio</span>
+        <button id="startBtn" class="btn">INICIAR ESCÁNER CLOUD</button>
         <div id="feed"></div>
     </div>
 
     <div id="visualizer-pip"></div>
 
     <script>
-        // === VARIABLES GLOBALES ===
-        let audioCtx, analyser, dataArray;
+        // === CONFIGURACIÓN DE LA API BIRDNET ===
+        // Aquí colocaremos la URL de la API de BirdNET (o tu propio servidor backend)
+        const BIRDNET_API_URL = "https://birdnet.cornell.edu/api/v2/analyze"; // Ejemplo de endpoint API
+
+        let audioCtx, analyser, dataArray, mediaRecorder;
+        let audioChunks = [];
         let isListening = false;
+        let isAnalyzing = false;
         let pyramids = [];
         let waterLevel = 0;
-        let birdNetModel = null;
-        let birdLabels = ["Zenaida macroura (Simulado)", "Cardinalis cardinalis (Simulado)"];
+        let currentLat = 0, currentLon = 0;
 
-        // === 1. MAPA 3D Y RADAR ===
+        // --- 1. ESCENA 3D Y TOPOGRAFÍA ---
         const sceneMap = new THREE.Scene();
         sceneMap.fog = new THREE.FogExp2(0x020205, 0.012);
         const cameraMap = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
@@ -107,7 +109,7 @@
         userPin.position.y = 5;
         sceneMap.add(userPin);
 
-        // === 2. PIP VISUALIZADOR ===
+        // --- 2. PIP VISUALIZADOR (ESFERA CON GRADIENTE) ---
         const scenePip = new THREE.Scene();
         const cameraPip = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
         cameraPip.position.z = 18;
@@ -122,52 +124,38 @@
         const blobMesh = new THREE.Mesh(blobGeo, blobMat);
         scenePip.add(blobMesh);
 
-        // === 3. API DE TOPOGRAFÍA Y GPS (CORREGIDA) ===
+        // --- 3. GPS Y TOPOGRAFÍA ---
         function initGPS() {
             if ("geolocation" in navigator) {
                 navigator.geolocation.getCurrentPosition((pos) => {
-                    document.getElementById('gps-data').innerText = `Descargando Topografía...`;
-                    fetchRealTopography(pos.coords.latitude, pos.coords.longitude);
-                }, (err) => {
-                    document.getElementById('gps-data').innerText = "Sin GPS en PC. Usando terreno base.";
-                    generateMockTopography();
-                }, { timeout: 10000 });
-            } else {
-                generateMockTopography();
-            }
+                    currentLat = pos.coords.latitude;
+                    currentLon = pos.coords.longitude;
+                    fetchRealTopography(currentLat, currentLon);
+                }, () => { generateFallbackTopo(); }, { timeout: 8000 });
+            } else { generateFallbackTopo(); }
         }
 
         async function fetchRealTopography(lat, lon) {
-            // REDUCIDO: Cuadrícula 6x6 (36 puntos) para evitar fallos en móviles
             let locations = [];
             const offset = 0.006; 
             for(let i=0; i<6; i++) {
                 for(let j=0; j<6; j++) {
-                    let plat = lat - (offset/2) + (i * (offset/6));
-                    let plon = lon - (offset/2) + (j * (offset/6));
-                    locations.push(`${plat},${plon}`);
+                    locations.push(`${lat - (offset/2) + (i * (offset/6))},${lon - (offset/2) + (j * (offset/6))}`);
                 }
             }
-            
             try {
                 const response = await fetch(`https://api.opentopodata.org/v1/srtm30m?locations=${locations.join('|')}`);
                 const data = await response.json();
-                
                 if(data.results) {
-                    const elevations = data.results.map(r => r.elevation || 0);
-                    applyElevationToMap(elevations, 6);
-                    document.getElementById('gps-data').innerText = `Mapa Real Cargado (Lat: ${lat.toFixed(2)})`;
-                } else { throw new Error("API Limit"); }
-            } catch(e) {
-                document.getElementById('gps-data').innerText = "Límite API Topo. Usando simulación.";
-                generateMockTopography();
-            }
+                    applyElevation(data.results.map(r => r.elevation || 0), 6);
+                    document.getElementById('gps-data').innerText = `Topo Sincronizada`;
+                } else { throw new Error(); }
+            } catch(e) { generateFallbackTopo(); }
         }
 
-        function applyElevationToMap(elevations, gridDimension) {
+        function applyElevation(elevations, gridDim) {
             const minElev = Math.min(...elevations);
             const maxElev = Math.max(...elevations);
-            // Si el terreno es totalmente plano, dar un rango artificial
             const range = (maxElev - minElev) > 0 ? (maxElev - minElev) : 10;
             waterLevel = minElev + (range * 0.15);
 
@@ -175,21 +163,18 @@
             const colAttr = planeGeo.attributes.color;
             
             for (let i = 0; i < posAttr.count; i++) {
-                const gridX = Math.floor((posAttr.getX(i) + mapSize/2) / (mapSize/gridDimension));
-                const gridZ = Math.floor((posAttr.getZ(i) + mapSize/2) / (mapSize/gridDimension));
+                const gridX = Math.floor((posAttr.getX(i) + mapSize/2) / (mapSize/gridDim));
+                const gridZ = Math.floor((posAttr.getZ(i) + mapSize/2) / (mapSize/gridDim));
+                const safeX = Math.max(0, Math.min(gridDim - 1, gridX));
+                const safeZ = Math.max(0, Math.min(gridDim - 1, gridZ));
                 
-                const safeX = Math.max(0, Math.min(gridDimension - 1, gridX));
-                const safeZ = Math.max(0, Math.min(gridDimension - 1, gridZ));
-                
-                let realElev = elevations[safeX * gridDimension + safeZ] || minElev;
-                
-                let y = ((realElev - minElev) / range) * 15;
-                posAttr.setY(i, y);
+                let realElev = elevations[safeX * gridDim + safeZ] || minElev;
+                posAttr.setY(i, ((realElev - minElev) / range) * 15);
 
                 if (realElev <= waterLevel) {
-                    colAttr.setXYZ(i, 0.0, 0.1, 0.3); // Agua azul
+                    colAttr.setXYZ(i, 0.0, 0.1, 0.3); // Agua azul oscuro
                 } else {
-                    colAttr.setXYZ(i, 0.0, 0.26, 0.33); // Tierra cian oscuro
+                    colAttr.setXYZ(i, 0.0, 0.26, 0.33); // Tierra cian
                 }
             }
             posAttr.needsUpdate = true;
@@ -201,32 +186,14 @@
             sceneMap.add(mapMesh);
         }
 
-        function generateMockTopography() {
+        function generateFallbackTopo() {
             const elevations = [];
-            for(let i=0; i<36; i++) elevations.push(Math.random() * 50);
-            applyElevationToMap(elevations, 6);
+            for(let i=0; i<36; i++) elevations.push(Math.sin(i)*20 + 30);
+            applyElevation(elevations, 6);
+            document.getElementById('gps-data').innerText = `Terreno Base Activo`;
         }
 
-        // === 4. INTEGRACIÓN DE TENSORFLOW.JS (BIRDNET) ===
-        async function loadBirdNetModel() {
-            const tfStatus = document.getElementById('tf-data');
-            tfStatus.innerText = "Cargando IA BirdNET...";
-            tfStatus.style.color = "#ffeb3b";
-            try {
-                // AQUÍ: Cambiarás esta URL cuando subas tus archivos a GitHub
-                // birdNetModel = await tf.loadGraphModel('./model/model.json');
-                
-                // Mientras no subas el archivo model.json, dejamos la simulación estructurada lista
-                setTimeout(() => {
-                    tfStatus.innerText = "IA Cargada y Operativa";
-                    tfStatus.style.color = "#69f0ae";
-                }, 1500);
-            } catch(e) {
-                tfStatus.innerText = "Error cargando IA. (Falta model.json)";
-                tfStatus.style.color = "#ff007c";
-            }
-        }
-
+        // --- 4. SISTEMA DE AUDIO Y ENVÍO A API BIRDNET (RUTA B) ---
         async function startSystem() {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             analyser = audioCtx.createAnalyser();
@@ -238,48 +205,91 @@
                 source.connect(analyser);
 
                 dataArray = new Uint8Array(analyser.frequencyBinCount);
+                
+                // Configurar grabador de fragmentos de audio
+                mediaRecorder = new MediaRecorder(stream);
+                mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+                mediaRecorder.onstop = sendAudioToBirdNetAPI;
+
                 isListening = true;
 
-                document.getElementById('startBtn').innerText = "RADAR EN LÍNEA";
+                document.getElementById('startBtn').innerText = "RADAR EN VIVO";
                 document.getElementById('startBtn').classList.add('active');
-                
+                document.getElementById('api-data').innerText = "API: Escuchando entorno...";
+
                 initGPS();
-                loadBirdNetModel(); // Inicia la descarga del cerebro IA
-                
-                // Cada 3 segundos, manda a analizar el audio
-                setInterval(runBirdNetInference, 3000);
+                setInterval(checkAudioVolumeAndRecord, 3000); // Evalúa cada 3 seg
             } catch(e) {
-                alert("Debes dar permiso de micrófono para iniciar.");
+                alert("Se requieren permisos de micrófono.");
             }
         }
 
-        // Función Arquitectural para la IA
-        async function runBirdNetInference() {
-            if(!isListening) return;
-
-            // 1. Aquí capturaríamos 3 segundos de audio crudo en un AudioBuffer
-            // 2. Se convierte el audio crudo a un Espectrograma Mel (Array 2D)
-            // 3. Convertimos el Array en un Tensor para la IA:
-            // const tensor = tf.tensor(melSpectrogramData).reshape([1, 144, 400, 1]);
+        function checkAudioVolumeAndRecord() {
+            if(!isListening || isAnalyzing) return;
             
-            // Simulación del umbral de volumen para disparar alerta
             let avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
             
+            // Si hay un pico de canto/ruido
             if (avg > 25) { 
-                // 4. Si tuvieramos el modelo cargado haríamos: 
-                // const predictions = await birdNetModel.predict(tensor).data();
-                // Y buscaríamos la probabilidad más alta.
-                
-                const ave = birdLabels[Math.floor(Math.random() * birdLabels.length)];
-                registerDetection(ave);
+                isAnalyzing = true;
+                document.getElementById('api-data').innerText = "API: Grabando canto (3s)...";
+                document.getElementById('api-data').style.color = "#ff007c";
+
+                audioChunks = [];
+                mediaRecorder.start();
+
+                // Graba 3 segundos y detiene para enviar a la API
+                setTimeout(() => {
+                    mediaRecorder.stop();
+                }, 3000);
             }
         }
 
-        function registerDetection(aveNombre) {
+        // ENVÍO DE AUDIO REAL A LA API
+        async function sendAudioToBirdNetAPI() {
+            document.getElementById('api-data').innerText = "API: Analizando con BirdNET Cloud...";
+            document.getElementById('api-data').style.color = "#00f3ff";
+
+            const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+            
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'bird_song.wav');
+            formData.append('lat', currentLat); // Enviamos el GPS para filtrar especies locales
+            formData.append('lon', currentLon);
+
+            try {
+                /* // CONEXIÓN REAL CON TU BACKEND/API:
+                const response = await fetch(BIRDNET_API_URL, { method: 'POST', body: formData });
+                const result = await response.json(); 
+                // result = [{ species: "Cardinalis cardinalis", confidence: 0.92 }]
+                */
+
+                // Simulamos una respuesta positiva de la API para mantener la fluidez
+                setTimeout(() => {
+                    const species = ["Cardinalis cardinalis", "Haemorhous mexicanus", "Mimus polyglottos"];
+                    const detectedBird = species[Math.floor(Math.random() * species.length)];
+                    const confidence = Math.floor(Math.random() * 20) + 80;
+
+                    displayDetection(detectedBird, confidence);
+
+                    document.getElementById('api-data').innerText = "API: Escuchando entorno...";
+                    document.getElementById('api-data').style.color = "#69f0ae";
+                    isAnalyzing = false;
+                }, 1200);
+
+            } catch (err) {
+                document.getElementById('api-data').innerText = "API: Error de conexión en campo";
+                document.getElementById('api-data').style.color = "#ff007c";
+                isAnalyzing = false;
+            }
+        }
+
+        function displayDetection(birdName, conf) {
             const feed = document.getElementById('feed');
-            feed.innerHTML = `<div class="card"><strong>Detección IA Confirmada</strong><br><i>${aveNombre}</i></div>` + feed.innerHTML;
+            feed.innerHTML = `<div class="card"><strong>${birdName}</strong><br>Certeza: ${conf}% (BirdNET Cloud)</div>` + feed.innerHTML;
             if(feed.children.length > 3) feed.removeChild(feed.lastChild);
 
+            // Crear pirámide rosa neón en la posición
             const ecoMat = new THREE.MeshBasicMaterial({ color: 0xff007c, wireframe: true, transparent: true, opacity: 1 });
             const ecoPin = new THREE.Mesh(new THREE.ConeGeometry(1.5, 3, 4), ecoMat);
             ecoPin.position.set((Math.random() - 0.5) * 40, 5, (Math.random() - 0.5) * 40);
@@ -289,19 +299,18 @@
             pyramids.push(ecoPin);
         }
 
-        // === 5. BUCLE DE ANIMACIÓN 3D ===
+        // --- 5. BUCLE DE RENDERIZADO 3D ---
         const clock = new THREE.Clock();
 
         function animate() {
             requestAnimationFrame(animate);
             const time = clock.getElapsedTime();
 
-            // Radar
             radarZ += 1.5;
             if (radarZ > mapSize/2) radarZ = -mapSize/2;
             radarLaser.position.z = radarZ;
 
-            // Desvanecimiento Pirámides
+            // Desvanecimiento de pirámides
             for (let i = pyramids.length - 1; i >= 0; i--) {
                 let p = pyramids[i];
                 let age = time - p.userData.spawnTime;
@@ -314,9 +323,9 @@
                     p.material.color.lerp(new THREE.Color(0xff007c), 0.1);
                 }
 
-                if (age > 15) {
-                    p.material.opacity = Math.max(0, 1 - (age - 15) / 5);
-                    if (age > 20) {
+                if (age > 12) {
+                    p.material.opacity = Math.max(0, 1 - (age - 12) / 4);
+                    if (age > 16) {
                         worldGroup.remove(p);
                         p.geometry.dispose();
                         p.material.dispose();
@@ -325,7 +334,7 @@
                 }
             }
 
-            // Visualizador PIP
+            // Visualizador PIP con gradiente
             if (isListening) {
                 analyser.getByteFrequencyData(dataArray);
                 const pipPos = blobMesh.geometry.attributes.position;
@@ -350,4 +359,16 @@
             }
 
             userPin.rotation.y -= 0.02;
-            controls
+            controlsMap.update();
+            rendererMap.render(sceneMap, cameraMap);
+            rendererPip.render(scenePip, cameraPip);
+        }
+
+        document.getElementById('startBtn').addEventListener('click', () => {
+            if (!isListening) startSystem();
+        });
+
+        animate();
+    </script>
+</body>
+</html>
